@@ -5,10 +5,10 @@
 #include <iostream>
 #include <iomanip>
 
-#define REDUCTION_THREADS 128
+#define REDUCTION_THREADS 32*4
 #define DEBUG 0 //Activar la impresión de resultados por consola
 #define THRUST 0 //Activar el uso de la librería Thrust en lugar de la implementación en CUDA
-#define SHARED 0 //Usar memoria compartida en la implementación de búsqueda de mínimos y máximos
+#define SHARED 1 //Usar memoria compartida en la implementación de búsqueda de mínimos y máximos
 
 #if THRUST == 1
 //Thrust libs
@@ -42,6 +42,8 @@ void check(T err, const char* const func, const char* const file, const int line
 __global__ void parallelMinMax(float* min, float* max, int len, int threads)
 {
   int threadID = threadIdx.x + blockDim.x * blockIdx.x;
+  if (threadID > threads)
+    return;
 
   float tempMin = min[threadID + threads];
   min[threadID] = tempMin <= min[threadID] ? tempMin : min[threadID];
@@ -54,6 +56,8 @@ __global__ void parallelMinMax(float* min, float* max, int len, int threads)
 __global__ void parallelMinMaxInit(const float* input, float* min, float* max, int len, int threads)
 {
   int threadID = threadIdx.x + blockDim.x * blockIdx.x;
+  if (threadID > threads)
+    return;
 
   float tempMin = (threadID + threads) < len ? input[threadID + threads] : input[threadID];
   min[threadID] = tempMin <= input[threadID] ? tempMin : input[threadID];
@@ -244,7 +248,6 @@ void calculate_cdf(const float* const d_logLuminance,
   min_logLum = min;
   max_logLum = max;
 #else
-#define REDUCTION_THREADS 32
   // Obtener máximo y mínimo
   numThreads = (numRows * numCols) / 2;
   if (numThreads % 2 != 0) numThreads++;
