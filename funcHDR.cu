@@ -5,6 +5,28 @@
 #include <iostream>
 #include <iomanip>
 
+#define REDUCTION_THREADS 32
+#define DEBUG 0 //Activar la impresión de resultados por consola
+#define THRUST 0 //Activar el uso de la librería Thrust en lugar de la implementación en CUDA
+
+#if THRUST == 1
+//Thrust libs
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/binary_search.h>
+
+// simple routine to print contents of a vector
+template <typename Vector>
+void print_vector(const std::string& name, const Vector& v)
+{
+  typedef typename Vector::value_type T;
+  std::cout << "  " << std::setw(20) << name << "  ";
+  thrust::copy(v.begin(), v.end(), std::ostream_iterator<T>(std::cout, " "));
+  std::cout << std::endl;
+}
+#endif
+
+
 #define checkCudaErrors(val) check( (val), #val, __FILE__, __LINE__)
 
 template<typename T>
@@ -15,9 +37,6 @@ void check(T err, const char* const func, const char* const file, const int line
     exit(1);
   }
 }
-
-#define REDUCTION_THREADS 32
-#define DEBUG 1
 
 __global__ void parallelMinMax(float* min, float* max, int len, int threads)
 {
@@ -57,29 +76,30 @@ __global__ void histogram(const float* input, const size_t numCols, const size_t
   }
 }
 
-__global__ void scanReduce(float* scan, int start, int offset, int threads)
+__global__ void scanReduce(unsigned int* scan, int start, int offset, int threads, int len)
 {
   int threadID = threadIdx.x + blockDim.x * blockIdx.x;
-  if (threadID >= threads)
-    return;
   int index = start + threadID * offset * 2;
-
-  scan[index + offset] += scan[index];
+  int index2 = index + offset;
+  //if (index2 < len)
+    scan[index2] += scan[index];
 }
 
-__global__ void scanReverse(float* scan, int start, int offset, int threads)
+__global__ void scanReverse(unsigned int* scan, int start, int offset, int threads, int len)
 {
   int threadID = threadIdx.x + blockDim.x * blockIdx.x;
-  if (threadID >= threads)
-    return;
   int index = start + threadID * offset * 2;
+  int index2 = index + offset;
 
-  scan[index + offset] += scan[index];
+  float tmp = scan[index2];
+  //if(index2 < len)
+    scan[index2] += scan[index];
+    scan[index] = tmp;
 
-  if(threadID == 0)
+  /*if(threadID == 0)
   {
     scan[index] = 0;
-  }
+  }*/
 }
 
 void calculate_cdf(const float* const d_logLuminance,
@@ -99,6 +119,8 @@ void calculate_cdf(const float* const d_logLuminance,
 	  de los valores de luminancia. Se debe almacenar en el puntero c_cdf
 	*/
 
+#if THRUST == 0
+  // Obtener máximo y mínimo
   unsigned int numThreads = (numRows * numCols) / 2;
   if (numThreads % 2 != 0) numThreads++;
   unsigned int numBlocks;// = (numThreads - 1) / REDUCTION_THREADS + 1;
@@ -116,25 +138,27 @@ void calculate_cdf(const float* const d_logLuminance,
   checkCudaErrors(cudaMemcpy(&min_logLum, d_minArray, sizeof(float), cudaMemcpyDeviceToHost));
   checkCudaErrors(cudaMemcpy(&max_logLum, d_maxArray, sizeof(float), cudaMemcpyDeviceToHost));
   float range = max_logLum - min_logLum;
+
+  //Imprimir resultados de máximo, mínimo y rango
 #if DEBUG == 1
   std::cout << "Min: " << min_logLum << " | Max: " << max_logLum << std::endl;
   std::cout << "Rango a representar: " << range << std::endl;
-#endif
+#endif //DEBUG
   checkCudaErrors(cudaFree(d_minArray));
   checkCudaErrors(cudaFree(d_maxArray));
 
+  //Obtener histograma
   numThreads = numRows;
   numBlocks = (numThreads - 1) / REDUCTION_THREADS + 1;
-  unsigned int* d_histogram;
-  checkCudaErrors(cudaMalloc(&d_histogram, numBins * sizeof(unsigned int)));
-  histogram <<< dim3{ numBlocks, 1, 1 }, dim3{ REDUCTION_THREADS, 1, 1 } >>> (d_logLuminance, numCols, numRows, min_logLum, range, numBins, d_histogram);
+  histogram <<< dim3{ numBlocks, 1, 1 }, dim3{ REDUCTION_THREADS, 1, 1 } >>> (d_logLuminance, numCols, numRows, min_logLum, range, numBins, d_cdf);
   cudaDeviceSynchronize();
-  unsigned int* h_histogram = (unsigned int*) malloc(numBins * sizeof(unsigned int));
-  checkCudaErrors(cudaMemcpy(h_histogram, d_histogram, numBins * sizeof(unsigned int), cudaMemcpyDeviceToHost));
-  checkCudaErrors(cudaFree(d_histogram));
-#if DEBUG == 1
-  std::cout << "Histograma: ";
+ 
 
+  //Imprimir resultados del histograma
+#if DEBUG == 1
+  unsigned int* h_histogram = (unsigned int*)malloc(numBins * sizeof(unsigned int));
+  checkCudaErrors(cudaMemcpy(h_histogram, d_cdf, numBins * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+  std::cout << "Histograma: ";
   unsigned int total = 0;
   for(int i = 0 ; i < numBins; i++)
   {
@@ -147,24 +171,22 @@ void calculate_cdf(const float* const d_logLuminance,
   std::cout << "Total: " << total << std::endl;
   std::cout << "Total num*col: " << numCols*numRows << std::endl;
   std::cout << "Numbins: " << numBins << std::endl;
-#endif
+#endif //DEBUG
 
-  float* d_scan;
-  checkCudaErrors(cudaMalloc(&d_scan, numCols*numRows * sizeof(float)));
-  checkCudaErrors(cudaMemcpy(d_scan, d_logLuminance, numCols*numRows * sizeof(float), cudaMemcpyDeviceToDevice));
-  unsigned int len = numRows * numCols;
+  //Calcular exclusive scan a partir del histograma
+  unsigned int len = numBins;
   numThreads = len / 2;
-  unsigned int d = 0;
+  int d = 0;
   unsigned int start, offset = 1;
-  //Error después de ejecutar este bloque
   do {
     start = offset - 1;
     numBlocks = (numThreads - 1) / REDUCTION_THREADS + 1;
-    scanReduce << < numBlocks, REDUCTION_THREADS >> > (d_scan, start, offset, numThreads);
+    scanReduce << < numBlocks, REDUCTION_THREADS >> > (d_cdf, start, offset, numThreads, len);
     d++;
     numThreads >>= 1;
-  } while ((offset = (1 << d)) < len);
-  checkCudaErrors(cudaMemset(&d_scan[len-1], 0.0f, 1));
+    cudaDeviceSynchronize();
+  } while ((offset <<= 1) <= len/2);
+  checkCudaErrors(cudaMemset(&d_cdf[len-1], 0, sizeof(unsigned int)));
   numThreads = 1;
   while (d > 0)
   {
@@ -172,11 +194,111 @@ void calculate_cdf(const float* const d_logLuminance,
     offset = (1 << d);
     start = offset - 1;
     numBlocks = (numThreads - 1) / REDUCTION_THREADS + 1;
-    scanReverse << < numBlocks, REDUCTION_THREADS >> > (d_scan, start, offset, numThreads);
-    numThreads >>= 1;
-  } 
-  //Resultado en scan
+    scanReverse << < numBlocks, REDUCTION_THREADS >> > (d_cdf, start, offset, numThreads, len);
+    numThreads <<= 1;
+    cudaDeviceSynchronize();
+  }
+  cudaDeviceSynchronize();
 
-  checkCudaErrors(cudaFree(d_scan));
+  //Imprimir resultados del exclusive scan
+#if DEBUG == 1
+  unsigned int* h_scan = (unsigned int*)malloc(numBins * sizeof(unsigned int));
+  checkCudaErrors(cudaMemcpy(h_scan, d_cdf, numBins * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+  std::cout << "Exclusive scan: ";
+  for(int i = 0; i < numBins; i++)
+  {
+    if (i % 25 == 0)
+      std::cout << std::endl;
+    std::cout << h_scan[i] << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "Esperado: ";
+  total = 0;
+  for (int i = 0; i < numBins; i++)
+  {
+    if (i % 25 == 0)
+      std::cout << std::endl;
+    std::cout << total << " ";
+    total += h_histogram[i];
+  }
+  std::cout << std::endl;
   free(h_histogram);
+#endif //DEBUG
+
+#else // Usar THRUST
+
+  //Calcular mínimo, máximo y range con THRUST
+  unsigned int len = numRows * numCols;
+  thrust::device_ptr<const float> d_t_luminancePtr = thrust::device_pointer_cast(d_logLuminance);
+  thrust::device_vector<float> d_t_luminance(d_t_luminancePtr, d_t_luminancePtr + len);
+  auto minmax = thrust::minmax_element(d_t_luminance.begin(), d_t_luminance.end());
+  min_logLum = *minmax.first;
+  max_logLum = *minmax.second;
+  float range = max_logLum - min_logLum;
+#if DEBUG == 1
+  std::cout << "Min: " << min_logLum << " | Max: " << max_logLum << std::endl;
+  std::cout << "Rango a representar: " << range << std::endl;
+#endif //DEBUG
+  //Histograma adaptado de: https://github.com/thrust/thrust/blob/master/examples/histogram.cu
+  /*
+   *thrust::device_vector<int> histogram;
+  thrust::sort(d_t_luminance.begin(), d_t_luminance.end());
+  histogram.resize(numBins);
+  thrust::counting_iterator<int> search_begin(0);
+  thrust::upper_bound(d_t_luminance.begin(), d_t_luminance.end(),
+    search_begin, search_begin + numBins,
+    histogram.begin());
+  print_vector("cumulative histogram", histogram);
+  thrust::adjacent_difference(histogram.begin(), histogram.end(),
+    histogram.begin());
+#if DEBUG == 1
+  std::cout << "Histograma: ";
+  thrust::copy(histogram.begin(), histogram.end(), std::ostream_iterator<int>(std::cout, " "));
+  std::cout << std::endl;
+#endif //DEBUG
+  */
+
+  //Histograma de ejemplos de Thrust no funciona
+  cudaDeviceSynchronize();
+  unsigned int numThreads = numRows;
+  unsigned int numBlocks = (numThreads - 1) / REDUCTION_THREADS + 1;
+  histogram << < dim3{ numBlocks, 1, 1 }, dim3{ REDUCTION_THREADS, 1, 1 } >> > (d_logLuminance, numCols, numRows, min_logLum, range, numBins, d_cdf);
+  cudaDeviceSynchronize();
+
+  //Imprimir resultados de histograma
+#if DEBUG == 1
+  unsigned int* h_histogram = (unsigned int*)malloc(numBins * sizeof(unsigned int));
+  checkCudaErrors(cudaMemcpy(h_histogram, d_cdf, numBins * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+  std::cout << "Histograma: ";
+  unsigned int total = 0;
+  for (int i = 0; i < numBins; i++)
+  {
+    if (i % 25 == 0)
+      std::cout << std::endl;
+    std::cout << h_histogram[i] << " ";
+    total += h_histogram[i];
+  }
+  std::cout << std::endl;
+  std::cout << "Total: " << total << std::endl;
+  std::cout << "Total num*col: " << numCols * numRows << std::endl;
+  std::cout << "Numbins: " << numBins << std::endl;
+  free(h_histogram);
+#endif //DEBUG  
+
+
+  thrust::device_ptr<unsigned int> d_t_histogramPtr = thrust::device_pointer_cast(d_cdf);
+  thrust::device_vector<unsigned int> d_t_histogram(d_t_histogramPtr, d_t_histogramPtr + numBins);
+  thrust::device_ptr<unsigned int> d_t_cdf = thrust::device_pointer_cast(d_cdf);
+  thrust::exclusive_scan(d_t_histogram.begin(), d_t_histogram.end(), d_t_cdf);
+#if DEBUG == 1
+  std::cout << "Exclusive scan: ";
+  for (int i = 0; i < numBins; i++)
+  {
+    if (i % 25 == 0)
+      std::cout << std::endl;
+    std::cout << d_t_cdf[i] << " ";
+  }
+  std::cout << std::endl;
+#endif //DEBUG
+#endif //THRUST
 }

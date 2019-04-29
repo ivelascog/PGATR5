@@ -1,0 +1,90 @@
+\documentclass[10pt,oneside,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{indentfirst}
+\usepackage{enumitem}
+\usepackage[spanish]{babel}
+\usepackage[export]{adjustbox}
+\usepackage{graphicx}
+\graphicspath{ {img/} }
+\usepackage{listings}
+\usepackage{subfig}
+\usepackage{cite}
+\usepackage{pgfplots}
+
+\addtolength{\oddsidemargin}{-.300in}
+\addtolength{\evensidemargin}{-.300in}
+\addtolength{\textwidth}{0.600in}
+\addtolength{\topmargin}{-.300in}
+\addtolength{\textheight}{0.600in} %1.75
+
+\begin{document}
+\begin{titlepage}
+
+\title{\Huge Procesadores Gráficos y Aplicaciones en Tiempo Real  \\[0.7in] \LARGE Tone Mapping en CUDA y Thrust\\[3.6in]}
+\date{}
+\author{Álvaro Muñoz Fernández\\
+Iván Velasco González}
+\maketitle
+\thispagestyle{empty}
+\end{titlepage}
+\newpage
+\tableofcontents
+\newpage
+
+\section{Introducción}
+El objetivo de esta práctica consiste en la implementación de varios de los pasos intermedios necesarios para la aplicación de la técnica de \textit{Tone Mapping}. Para ello se realizarán las implementaciones de varios algoritmos paralelos tanto en código CUDA como mediante la librería Thrust.\\
+
+\section{Directivas de compilador}
+Para facilitar el desarrollo y la realización de pruebas se ha optado por utilizar directivas de preprocesador. Estas están definidas al inicio del fichero con comentarios que describen su comportamiento. Mediante estas directivas puede alternarse entre el uso de la implementación en CUDA o la implementación en Thrust, además de activar o desactivar el volcado de resultados por consola mediante la directiva DEBUG.
+
+\section{Estructura del código}
+Todo el código escrito para la práctica se encuentra en el fichero \textit{funcHDR.cu} proporcionado como material de apoyo. En este fichero hay definidas varias funciones que han sido completadas para cumplir los requisitos de la entrega y que se explican a continuación:
+
+\subsection{calculate\_cdf()}
+Esta es la función principal del código de alumno que es llamada desde la función main() de la aplicación. En ella se realizan las inicializaciones de variables y llamadas a los diferentes kernels a emplear durante la ejecución de la práctica.\\
+
+El contenido de esta función se ha dividido en dos bloques independientes, siendo compilado sólo uno de ellos en función del valor de la directiva THRUST, que indicará si debe utilizarse la implementación en CUDA o la implementación en Thrust.\\
+
+Independientemente de la implementación utilizada, cada uno de los dos bloques está además subdividido en varios bloques, cada uno destinado al cálculo de uno de los pasos intermedios a implementar en la práctica. El primero corresponde al cálculo de los valores mínimos y máximos del buffer de luminancias. Después se calcula un histograma a partir de las luminancias y el número indicado de bins, utilizando la fórmula descrita en el enunciado de la práctica. Finalmente se calcula el \textit{exclusive scan}, que es almacenado en la variable de salida \textit{d\_cdf}. El flujo de ejecución vuelve entonces a la función principal del programa.
+
+\subsection{parallelMinMax()}
+Este kernel se encarga únicamente de recorrer el buffer de luminancias buscando los valores mínimo y máximo, empleando para ello el método paralelo mediante comparación de pares propuesto en la asignatura, en el que se realizan varias iteraciones, empezando con un número de threads igual a la mitad de los elementos del buffer y reduciendo el número de threads a la mitad en cada iteración, hasta terminar de reducir por completo el buffer a un solo valor.
+
+\subsection{parallelMinMaxInit()}
+Este kernel auxiliar se emplea en la primera iteración para solucionar el caso inicial en el que deben tomarse valores directamente desde el buffer de luminancias y almacenarlos en los buffers auxiliares que se emplearán para realizar las operaciones de reducción. De esta forma no se altera el buffer de luminancias durante la ejecución de las operaciones de reducción, operándose en las futuras iteraciones exclusivamente sobre los arrays auxiliares.
+
+\subsection{histogram()}
+Este kernel se ejecutará en un número determinado de threads (se ha optado por utilizar un thread por cada fila de la imagen) que recorrerán una porción del buffer de luminancias (en nuestro caso recorrerán los valores de la fila que les corresponde) y calcularán el bin correspondiente a cada valor de luminancia encontrado, acumulando el contador correspondiente a dicho bin de forma atómica.
+
+\subsection{scanReduce()}
+El primer kernel utilizado el cálculo del \textit{exclusive scan} paralelo, que se encarga de realizar sumas parciales y almacenarlas en el buffer mediante el algoritmo desarrollado por Blelloch. Para ello inicia la ejecución con N/2 threads, siendo N el número de elementos del buffer, y realizando sumas parciales que almacena de nuevo en el buffer. En cada iteración se divide el número de threads a la mitad hasta reducirse a 1, calculándose el \emph{offset} y \emph{stride} adecuados para cada iteración y almacenando los resultados de las sumas parciales de los elementos correspondientes. 
+
+\subsection{scanReverse()}
+El segundo kernel del cálculo de \textit{exclusive scan} recibirá los resultados obtenidos tras la ejecución del kernel previo, asignará un valor de 0 al último elemento del array e iniciará un proceso similar al del kernel \textit{scanReduce()}, pero de forma inversa. Esto quiere decir que en lugar de empezar con N/2 threads empezará con uno, e irá duplicándolos hasta llegar a N/2 threads, usando los valores de \emph{offset} y \emph{stride} adecuados. Adicionalmente, tras calcular la suma parcial de cada pareja de elementos y almacenarlos en la posición del último de los dos elementos, se almacenará el valor inicial del segundo elemento en la posición del primero. Al terminar este proceso se obtendrán los resultados acumulados del histograma.
+
+\section{Mejoras implementadas}
+\subsection{Minimización de reserva de memoria}
+Para evitar overhead durante la ejecución se ha reducido al mínimo la reserva de memoria para las operaciones de los algoritmos. Sólo se ha reservado memoria para los buffers auxiliares de cálculo de mínimos y máximos, siendo en cada caso necesario un buffer de la mitad de elementos que el buffer de luminancias original. Para el resto de operaciones se utilizan los buffers ya existentes, operándose el histograma y el \emph{exclusive scan} directamente sobre el buffer de salida, \emph{c\_cdf}.
+
+\subsection{Uso de la librería Thrust}
+Se ha realizado una implementación alternativa usando la librería Thrust. No ha sido posible implementar el cálculo del histograma mediante la librería ya que, a pesar de haber buscado ejemplos en la web, el único que parecía factible se ha implementado pero no ha funcionado correctamente, a pesar de haber utilizado el código de ejemplo disponible en el repositorio de CUDA. El código adaptado del ejemplo se ha mantenido en el fichero de código fuente, aunque se ha comentado y se ha añadido en su lugar el kernel de CUDA desarrollado para la práctica.\\
+
+El resto de apartados se han implementado mediante las funciones disponibles en Thrust, procurando no realizar copias innecesarias de memoria haciendo una conversión de los punteros de CUDA a los \emph{wrappers} definidos por la librería Thrust.\\
+
+Adicionalmente se han realizado 10 ejecuciones consecutivas de la aplicación sobre la imagen \textit{waterfall\_bg.exr} tanto con la implementación en CUDA como en Thrust, obteniéndose como resultado una media de tiempo de ejecución de 1.22ms utilizando Thrust y una media de 2.45ms con nuestra implementación en CUDA. Estos resultados indican que la implementación en CUDA de cálculo de \emph{min/max} y de \emph{exclusive scan} tiene mucho margen de optimización.
+
+\subsection{Tamaño de bloque}
+Después de una breve investigación en cuanto a implementaciones de este tipo de algoritmos, la conclusión a la que llegamos es que utilizaban bloques de una sola dimensión, por lo que así se han implementado en la práctica. Los bloques tendrán un número de threads múltiplo del tamaño de \textit{warp}, por tanto serán múltiplo de 32. Por simplificación durante la implementación finalmente hemos optado por utilizar bloques del tamaño de \emph{warp}, es decir, de 32 threads.
+
+\section{Pruebas locales}
+Además de las pruebas descritas en el apartado de la librería Thrust, se han realizado pruebas sobre las imágenes de ejemplo para comprobar el correcto resultado de la ejecución. La coincidencia con las imágenes de ejemplo ha sido perfecta, a excepción de la imagen \textit{memorial\_raw\_large}, que tras ser procesada se almacena con unas dimensiones incorrectas. El problema parece provenir del propio código de apoyo, por lo que hemos tomado por válida nuestra implementación en función al resultado de las otras imágenes de ejemplo.
+
+\section{Valoración personal}
+La práctica ha sido intuitiva y no ha tenido una carga de trabajo alta, pero sí que han surgido algunos problemas durante la implementación. El primero de ellos, que en el enunciado se pedía una implementacion de \emph{exclusive scan} pero se proporcionaba como ejemplo el resultado de un \emph{inclusive scan}, lo que ha dado lugar a confusiones que sólo se han disuelto al terminar la práctica y poder comprobar los resultados con las imágenes de referencia.\\
+
+Además el cálculo de bins no especifica cómo tratar el último elemento, que si se aplica la fórmula tal cual se define en el enunciado queda excluido de cualquier bin, ya que tomará un valor de bin de $1 * numBins$, siendo este un índice fuera del buffer del histograma. Para solucionarlo hemos tomado como valor de bin el $min(bin, numBins-1)$.\\
+
+En cuanto a la implementación del método de Blelloch, las diapositivas, aunque daban la información necesaria, no eran del todo descriptivas. Las imágenes de ejemplo podían dar lugar a confusiones ya que había que entender cómo interpretar el orden de cada iteración, además de que en el paso de \emph{reverse} no queda suficientemente claro que los valores del segundo elemento de cada par deben copiarse después en la posición del primer elemento.
+
+\end{document}
