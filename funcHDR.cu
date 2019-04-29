@@ -5,9 +5,10 @@
 #include <iostream>
 #include <iomanip>
 
-#define REDUCTION_THREADS 32
+#define REDUCTION_THREADS 128
 #define DEBUG 0 //Activar la impresión de resultados por consola
 #define THRUST 0 //Activar el uso de la librería Thrust en lugar de la implementación en CUDA
+#define SHARED 0 //Usar memoria compartida en la implementación de búsqueda de mínimos y máximos
 
 #if THRUST == 1
 //Thrust libs
@@ -61,6 +62,96 @@ __global__ void parallelMinMaxInit(const float* input, float* min, float* max, i
   max[threadID] = tempMax >= input[threadID] ? tempMax : input[threadID];
 }
 
+__global__ void initSharedMinMax(const float* input, float* vmin, float* vmax,int len)
+{
+	__shared__ float sharedMax[REDUCTION_THREADS * 2];
+	__shared__ float sharedMin[REDUCTION_THREADS * 2];
+
+	int ThreadID = threadIdx.x + blockDim.x * 2 * blockIdx.x;
+	// Rellamos los valores de los threads
+	if (ThreadID > len)
+	{
+		sharedMax[threadIdx.x] = input[0] ;
+		sharedMin[threadIdx.x] = input[0] ;
+
+	} else
+	{
+		sharedMax[threadIdx.x] = input[ThreadID];
+		sharedMin[threadIdx.x] = sharedMax[threadIdx.x];
+
+		// Rellenamos los valores desplazados.
+		if (ThreadID + blockDim.x > len)
+		{
+			sharedMax[threadIdx.x + blockDim.x] = input[0];
+			sharedMin[threadIdx.x + blockDim.x] = input[0];
+		}
+		else
+		{
+			sharedMax[threadIdx.x + blockDim.x] = input[ThreadID + blockDim.x];
+			sharedMin[threadIdx.x + blockDim.x] = input[ThreadID + blockDim.x];
+		}
+	}
+
+	__syncthreads();
+
+	for (unsigned int desp = blockDim.x; desp > 0; desp /= 2)
+	{
+		if (threadIdx.x < desp) {
+			sharedMax[threadIdx.x] = max(sharedMax[threadIdx.x], sharedMax[threadIdx.x + desp]);
+			sharedMin[threadIdx.x] = min(sharedMin[threadIdx.x], sharedMin[threadIdx.x + desp]);
+		}
+		__syncthreads();
+	}
+
+	vmin[blockIdx.x] = sharedMin[0];
+	vmax[blockIdx.x] = sharedMax[0];
+}
+
+__global__ void sharedMinMax(float* vmin, float* vmax, int len)
+{
+	__shared__ float sharedMax[REDUCTION_THREADS * 2];
+	__shared__ float sharedMin[REDUCTION_THREADS * 2];
+
+	int ThreadID = threadIdx.x + blockDim.x * 2 * blockIdx.x;
+	// Rellamos los valores de los threads
+	if (ThreadID > len)
+	{
+		sharedMax[threadIdx.x] = vmax[0];
+		sharedMin[threadIdx.x] = vmin[0];
+
+	}
+	else
+	{
+		sharedMax[threadIdx.x] = vmax[ThreadID];
+		sharedMin[threadIdx.x] = vmin[ThreadID];
+
+		// Rellenamos los valores desplazados.
+		if (ThreadID + blockDim.x > len)
+		{
+			sharedMax[threadIdx.x + blockDim.x] = vmax[0];
+			sharedMin[threadIdx.x + blockDim.x] = vmin[0];
+		}
+		else
+		{
+			sharedMax[threadIdx.x + blockDim.x] = vmax[ThreadID + blockDim.x];
+			sharedMin[threadIdx.x + blockDim.x] = vmin[ThreadID + blockDim.x];
+		}
+	}
+
+	__syncthreads();
+
+	for (unsigned int desp = blockDim.x; desp > 0; desp /= 2)
+	{
+		if (threadIdx.x < desp) {
+			sharedMax[threadIdx.x] = max(sharedMax[threadIdx.x], sharedMax[threadIdx.x + desp]);
+			sharedMin[threadIdx.x] = min(sharedMin[threadIdx.x], sharedMin[threadIdx.x + desp]);
+		}
+		__syncthreads();
+	}
+	vmin[blockIdx.x] = sharedMin[0];
+	vmax[blockIdx.x] = sharedMax[0];
+}
+
 __global__ void histogram(const float* input, const size_t numCols, const size_t numRows, const float min, const float range, const size_t numBins, unsigned int* histogram)
 {
   int threadID = threadIdx.x + blockDim.x * blockIdx.x;
@@ -102,6 +193,30 @@ __global__ void scanReverse(unsigned int* scan, int start, int offset, int threa
   }*/
 }
 
+void getMaxMin(const float* input, int len, float&min, float&max, float& range)
+{
+	float* d_tempMin;
+	float* d_tempMax;
+	int numBlocks = (len + 1) / (REDUCTION_THREADS * 2) + 1;
+	cudaMalloc(&d_tempMin, numBlocks * sizeof(float));
+	cudaMalloc(&d_tempMax, numBlocks * sizeof(float));
+	initSharedMinMax<< <numBlocks, REDUCTION_THREADS >> > (input, d_tempMin,d_tempMax, len);
+	cudaDeviceSynchronize();
+
+	while (numBlocks > 1) {
+		int numBlocksTemp = numBlocks;
+		numBlocks = (numBlocks + 1) / (REDUCTION_THREADS * 2) + 1;
+		sharedMinMax<< <numBlocks, REDUCTION_THREADS >> > (d_tempMin, d_tempMax, numBlocksTemp);
+		cudaDeviceSynchronize();
+	}
+
+	cudaMemcpy(&min, d_tempMin, sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(&max, d_tempMax, sizeof(float), cudaMemcpyDeviceToHost);
+	range = max - min;
+	cudaFree(d_tempMin);
+	cudaFree(d_tempMax);
+}
+
 void calculate_cdf(const float* const d_logLuminance,
 	unsigned int* const d_cdf,
 	float &min_logLum,
@@ -119,11 +234,20 @@ void calculate_cdf(const float* const d_logLuminance,
 	  de los valores de luminancia. Se debe almacenar en el puntero c_cdf
 	*/
 
+  unsigned int numThreads, numBlocks;
+
 #if THRUST == 0
+
+#if SHARED == 1
+  float min, max, range2;
+  getMaxMin(d_logLuminance, numRows * numCols, min, max, range2);
+  min_logLum = min;
+  max_logLum = max;
+#else
+#define REDUCTION_THREADS 32
   // Obtener máximo y mínimo
-  unsigned int numThreads = (numRows * numCols) / 2;
+  numThreads = (numRows * numCols) / 2;
   if (numThreads % 2 != 0) numThreads++;
-  unsigned int numBlocks;// = (numThreads - 1) / REDUCTION_THREADS + 1;
   float* d_minArray, *d_maxArray;
   checkCudaErrors(cudaMalloc(&d_minArray, numThreads * sizeof(float)));
   checkCudaErrors(cudaMalloc(&d_maxArray, numThreads * sizeof(float)));
@@ -137,22 +261,23 @@ void calculate_cdf(const float* const d_logLuminance,
   }
   checkCudaErrors(cudaMemcpy(&min_logLum, d_minArray, sizeof(float), cudaMemcpyDeviceToHost));
   checkCudaErrors(cudaMemcpy(&max_logLum, d_maxArray, sizeof(float), cudaMemcpyDeviceToHost));
-  float range = max_logLum - min_logLum;
 
+  checkCudaErrors(cudaFree(d_minArray));
+  checkCudaErrors(cudaFree(d_maxArray));
+
+#endif
   //Imprimir resultados de máximo, mínimo y rango
+  float range = max_logLum - min_logLum;
 #if DEBUG == 1
   std::cout << "Min: " << min_logLum << " | Max: " << max_logLum << std::endl;
   std::cout << "Rango a representar: " << range << std::endl;
 #endif //DEBUG
-  checkCudaErrors(cudaFree(d_minArray));
-  checkCudaErrors(cudaFree(d_maxArray));
 
   //Obtener histograma
   numThreads = numRows;
   numBlocks = (numThreads - 1) / REDUCTION_THREADS + 1;
   histogram <<< dim3{ numBlocks, 1, 1 }, dim3{ REDUCTION_THREADS, 1, 1 } >>> (d_logLuminance, numCols, numRows, min_logLum, range, numBins, d_cdf);
   cudaDeviceSynchronize();
- 
 
   //Imprimir resultados del histograma
 #if DEBUG == 1
